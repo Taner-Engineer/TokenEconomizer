@@ -133,6 +133,32 @@ def parse_tool_catalog_claude(transcript_text, max_desc=200, snapshot=None):
     return {n: (snap.get(n, "") or "")[:max_desc] for n in names}
 
 
+def parse_tool_catalog_kimi(wire_text, max_desc=200):
+    """{tool_name: short_description} for a Kimi Code run, from the wire log's
+    `llm.tools_snapshot` records (the full `{name, description}` schemas the session was
+    offered). Snapshots repeat as tools change; the LAST one is the final loaded set."""
+    if not wire_text:
+        return {}
+    out = {}
+    for line in wire_text.splitlines():
+        line = line.strip()
+        if not line or '"llm.tools_snapshot"' not in line:
+            continue
+        try:
+            ev = json.loads(line)
+        except Exception:
+            continue
+        if ev.get("type") != "llm.tools_snapshot":
+            continue
+        snap = {}
+        for tool in ev.get("tools") or []:
+            if isinstance(tool, dict) and tool.get("name"):
+                snap[str(tool["name"])] = str(tool.get("description") or "")[:max_desc]
+        if snap:
+            out = snap
+    return out
+
+
 def _read(path):
     try:
         return open(path, encoding="utf-8", errors="replace").read()
@@ -144,6 +170,9 @@ def catalog_sources(run_dir_path, agent):
     """[(source_name, {tool: desc}), ...] for every catalog source that yielded tools."""
     if agent == "codex":
         return [("codex_default", dict(CODEX_DEFAULT_TOOL_CATALOG))]
+    if agent == "kimi":
+        cat = parse_tool_catalog_kimi(_read(os.path.join(run_dir_path, "transcript.jsonl")))
+        return [("kimi_tools_snapshot", cat)] if cat else []
     if agent == "claude":
         cat = parse_tool_catalog_claude(
             _read(os.path.join(run_dir_path, "transcript.jsonl")))

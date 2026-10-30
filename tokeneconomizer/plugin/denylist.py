@@ -20,6 +20,12 @@ session start, and the unit of removal is whatever that file can express:
     trusted folder (Copilot's `trustedFolders`). Copilot has no persistent per-tool filter
     (`--excluded-tools` is a launch flag; `permissions.deny` refuses calls but leaves the schema
     in the request), so a server is proposed only when every one of its tools has gone unused.
+  * Kimi Code -- a TOOL, through `disallowedTools` in the repository's
+    `.kimi-code/agents/agent.md`: a project agent named `agent` with `override: true` and a
+    `${base_prompt}` body keeps the stock system prompt while its frontmatter prunes the main
+    agent's tool list (the agent-file format's own fields). Applies from the next session,
+    like every host; a person's existing agent file is managed only when it already binds the
+    main agent and keeps disallowedTools as a block list.
 
 Rules common to all three:
 
@@ -52,9 +58,15 @@ from . import adapter as live_adapter
 SETTINGS_REL = os.path.join(".claude", "settings.local.json")
 CODEX_CONFIG_REL = os.path.join(".codex", "config.toml")
 COPILOT_SETTINGS_REL = os.path.join(".github", "copilot", "settings.local.json")
+# Kimi Code: the project's override of the default main agent. `override: true` + body
+# `${base_prompt}` keeps the stock system prompt while the frontmatter's disallowedTools
+# prunes the tool list (verified field in the agent-file format; takes effect for sessions
+# created after the write, like every host's lever).
+KIMI_AGENT_REL = os.path.join(".kimi-code", "agents", "agent.md")
 
-_SETTINGS = {"claude": SETTINGS_REL, "codex": CODEX_CONFIG_REL, "copilot": COPILOT_SETTINGS_REL}
-_UNITS = {"claude": "tool", "codex": "capability", "copilot": "MCP server"}
+_SETTINGS = {"claude": SETTINGS_REL, "codex": CODEX_CONFIG_REL, "copilot": COPILOT_SETTINGS_REL,
+             "kimi": KIMI_AGENT_REL}
+_UNITS = {"claude": "tool", "codex": "capability", "copilot": "MCP server", "kimi": "tool"}
 
 # Codex capability -> (table or None for top level, key, TOML value). Each probed project-local
 # on 0.153.1 (see the module docstring); `te_harness.codex` holds the launch-time superset.
@@ -518,11 +530,145 @@ def codex_project_trusted(repo_root, env=None):
     return False
 
 
+# ---- Kimi Code: disallowedTools in the project's .kimi-code/agents/agent.md ---------------
+# A project-scoped agent file named `agent` with override: true replaces the default main
+# agent; a body of ${base_prompt} keeps the stock system prompt, so the frontmatter's
+# disallowedTools is the whole effect. TE creates that file when absent; when the person has
+# one already, only a frontmatter with name: agent and override: true that carries
+# disallowedTools as a block list is managed -- anything else is theirs and left alone.
+_KIMI_MARKER = "# Written by TokenEconomizer (per-repository tool deny list)"
+_KIMI_BODY = "${base_prompt}"
+_KIMI_LIST_RE = re.compile(r"^(?P<key>disallowedTools)\s*:\s*(?P<rest>.*)$")
+
+
+def _kimi_template(tools):
+    rows = ["---", "name: agent", "override: true", "disallowedTools:"]
+    rows += [f"  - {t}" for t in tools]
+    rows += ["---", "", _KIMI_MARKER, "", _KIMI_BODY, ""]
+    return "\n".join(rows)
+
+
+def _kimi_frontmatter(text):
+    """(fm_lines, body) of an agent file, or None when it has no --- frontmatter."""
+    lines = text.splitlines()
+    if not lines or lines[0].strip() != "---":
+        return None
+    for i in range(1, len(lines)):
+        if lines[i].strip() == "---":
+            return lines[1:i], "\n".join(lines[i + 1:])
+    return None
+
+
+def _kimi_list_span(fm):
+    """(start, end, items) of the `disallowedTools:` block list in frontmatter lines, or
+    (insert_at, insert_at, None) where the key should be added; None when the key exists in
+    a form TE does not manage (inline list, comma string)."""
+    insert_at = len(fm)
+    for i, line in enumerate(fm):
+        m = _KIMI_LIST_RE.match(line.strip())
+        if not m:
+            continue
+        if m.group("rest"):
+            return None                    # inline form: the person's, whatever it says
+        items, j = [], i + 1
+        while j < len(fm) and re.match(r"\s*-\s+\S", fm[j]):
+            items.append(re.sub(r"^\s*-\s+", "", fm[j]).strip())
+            j += 1
+        return (i, j, items)
+    for i, line in enumerate(fm):          # keep name/override before a new key
+        if re.match(r"\w", line):
+            insert_at = i
+            break
+    return (insert_at, insert_at, None)
+
+
+def _kimi_is_main_override(fm):
+    """The frontmatter binds the default main agent (name: agent + override: true) -- without
+    both, a disallowedTools list here would not prune the main agent's tools."""
+    name, override = False, False
+    for line in fm:
+        s = line.strip()
+        if s.startswith("name:"):
+            name = s.split(":", 1)[1].strip() == "agent"
+        if s.startswith("override:"):
+            override = s.split(":", 1)[1].strip().lower() == "true"
+    return name and override
+
+
+def _apply_kimi(repo_root, tools, store):
+    path = settings_path(repo_root, "kimi")
+    _guard_target(repo_root, path)
+    if not os.path.exists(path):
+        _write_text(path, _kimi_template(sorted(tools)))
+        _exclude_from_git(repo_root, KIMI_AGENT_REL)
+        _record(store, set(applied(store, path)) | set(tools), path)
+        return sorted(tools)
+    with open(path, encoding="utf-8") as fh:
+        text = fh.read()
+    parts = _kimi_frontmatter(text)
+    if parts is None:
+        raise RuntimeError(f"refusing to edit {path}: no --- frontmatter; add one or delete "
+                           "the file so te can create it")
+    fm, body = parts
+    if not _kimi_is_main_override(fm):
+        raise RuntimeError(f"refusing to edit {path}: it does not bind the default main agent "
+                           "(needs name: agent and override: true); merge disallowedTools by hand")
+    span = _kimi_list_span(fm)
+    if span is None:
+        raise RuntimeError(f"refusing to edit {path}: disallowedTools is not a block list; "
+                           "merge the proposal by hand")
+    start, end, items = span
+    if items is None:                       # key absent: insert a fresh block
+        fm = fm[:start] + ["disallowedTools:"] + [f"  - {t}" for t in sorted(tools)] + fm[start:]
+        added = list(tools)
+    else:
+        added = [t for t in tools if t not in items]
+        if added:
+            fm = fm[:end] + [f"  - {t}" for t in sorted(added)] + fm[end:]
+    if added:
+        _write_text(path, "---\n" + "\n".join(fm) + "\n---\n" + body)
+        _record(store, set(applied(store, path)) | set(added), path)
+    return added
+
+
+def _restore_kimi(repo_root, store, tools=None):
+    mine = set(applied(store, settings_path(repo_root, "kimi")))
+    target = mine if not tools else mine & set(tools)
+    if not target:
+        return []
+    path = settings_path(repo_root, "kimi")
+    _guard_target(repo_root, path)
+    with open(path, encoding="utf-8") as fh:
+        text = fh.read()
+    parts = _kimi_frontmatter(text)
+    if parts is None:
+        return []
+    fm, body = parts
+    span = _kimi_list_span(fm)
+    if not span or span[2] is None:
+        return []
+    start, end, items = span
+    remaining = [t for t in items if t not in target]
+    ours_left = [t for t in remaining if t in mine]
+    fm = fm[:start] + ([ "disallowedTools:"] + [f"  - {t}" for t in remaining]
+                       if remaining else []) + fm[end:]
+    bare = [l for l in fm if l.strip() and not l.strip().startswith("#")]
+    if (not remaining and bare == ["name: agent", "override: true"]
+            and body.strip() == _KIMI_MARKER + "\n\n" + _KIMI_BODY):
+        os.remove(path)                     # a file te created, holding nothing of anyone's
+    else:
+        _write_text(path, "---\n" + "\n".join(fm) + "\n---\n" + body)
+    _record(store, mine - target, path)
+    return sorted(target)
+
+
 # ---- dispatch ------------------------------------------------------------------------------
 def apply(repo_root, tools, store, host="claude"):
     """Write `tools` (tools, capabilities or MCP servers, by host). Returns those newly added."""
     if host == "codex":
         return _apply_codex(repo_root, tools, store)
+    if host == "kimi":
+        return _apply_kimi(repo_root, tools, store)
     return _apply_json_list(repo_root, tools, store, host)
 
 
@@ -530,6 +676,8 @@ def restore(repo_root, store, tools=None, host="claude"):
     """Remove entries this plugin added (all of them, or just `tools`). Returns removed."""
     if host == "codex":
         return _restore_codex(repo_root, store, tools)
+    if host == "kimi":
+        return _restore_kimi(repo_root, store, tools)
     return _restore_json_list(repo_root, store, tools, host)
 
 

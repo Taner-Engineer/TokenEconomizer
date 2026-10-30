@@ -8,6 +8,7 @@
                          prompt input locally (`codex debug prompt-input`) and Copilot's request
                          is captured by a scripted endpoint on localhost, so neither calls a model.
 """
+import glob
 import json
 import os
 import shutil
@@ -193,6 +194,22 @@ def _copilot_version(cli="copilot"):
 
 def refresh_catalog(state_root, cli=None, host="claude"):
     """Record the tool list a fresh session loads on this machine."""
+    if host == "kimi":
+        from .hosts import kimi_home
+        from .. import trace
+        wires = glob.glob(os.path.join(kimi_home(), "sessions", "*", "session_*",
+                                       "agents", "*", "wire.jsonl"))
+        if not wires:
+            raise RuntimeError("no Kimi Code session found under "
+                               f"{kimi_home()} to read the tool list from")
+        newest = max(wires, key=os.path.getmtime)
+        with open(newest, encoding="utf-8", errors="replace") as fh:
+            tools = sorted(trace.parse_tool_catalog_kimi(fh.read()))
+        if not tools:
+            raise RuntimeError("the newest Kimi Code wire log carries no llm.tools_snapshot")
+        path = live_adapter.catalog_path(state_root, "kimi")
+        _write_json(path, {"tools": tools, "source_wire": newest, "probed_at": time.time()})
+        return path, tools
     if host == "copilot":
         body = copilot_capture(cli=cli or "copilot")
         tools = [t for t in _request_tools(body) if t]

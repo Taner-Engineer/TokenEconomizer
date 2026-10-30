@@ -7,7 +7,8 @@
                                       settings: tools (Claude Code), capabilities (Codex) or
                                       MCP servers (Copilot)
     te toolprune restore [ITEM ...]   remove entries this plugin added
-    te toolprune refresh-catalog      record the tool list a fresh session loads (Claude, Copilot)
+    te toolprune refresh-catalog      record the tool list a fresh session loads (Claude,
+                                      Copilot, Kimi -- Kimi reads it from its newest wire log)
     te toolprune measure              measure the request with and without the proposal
     te toolprune apply-pending        write a pending `auto` deny list once the repository has
                                       been idle long enough (the fold starts it, detached)
@@ -24,6 +25,11 @@
                                       now (runs by itself, once, after an upgrade)
     te repos merge KEY [INTO]         merge the state directory KEY into INTO (default: this
                                       repository's), for state whose checkouts are gone
+    te kimi-import                    record finished Kimi Code sessions (whose agent has no
+                                      hooks) under their repositories and fold them
+    te kimi-hooks [install|uninstall] write (or remove) TokenEconomizer's [[hooks]] rules in
+                                      Kimi Code's config.toml; after install, sessions are
+                                      recorded natively and kimi-import is only a migration
     te doctor                         check the installation
     te --host copilot probe           real Copilot sessions in a throwaway repository: does a
                                       learned fact change what the model does, and what does the
@@ -31,8 +37,8 @@
 
 `te facts` and `te untool` are the earlier names of `microskills` and `toolprune`, and still work.
 `--cwd` picks the repository (default: the current directory) and `--host` the agent
-(claude | codex | copilot | pi; default: `TE_HOST`, else the agent whose shell runs `te`, else
-claude).
+(claude | codex | copilot | pi | kimi; default: `TE_HOST`, else the agent whose shell runs `te`,
+else claude).
 """
 import argparse
 import glob
@@ -520,6 +526,70 @@ def cmd_judge(args):
     return 0
 
 
+def cmd_kimi_hooks(args):
+    """Install or remove TokenEconomizer's [[hooks]] block in Kimi Code's config.toml."""
+    from . import kimihooks
+    if args.action == "install":
+        path, changed, command = kimihooks.install()
+        if not command:
+            print("not installed: the plugin's scripts/te-hook was not found "
+                  "(set TE_PLUGIN_ROOT to the plugin checkout).")
+            return 1
+        print(f"{'wrote' if changed else 'already present'}: {path} "
+              f"(hook command: {command}; new Kimi Code sessions activate it)")
+        return 0
+    path, changed = kimihooks.uninstall()
+    print(f"{'removed the hooks block from' if changed else 'no hooks block in'} {path}")
+    return 0
+
+
+def cmd_kimi_import(args):
+    """Record finished Kimi Code sessions into the stores their repositories fold from.
+
+    Kimi Code has no hook protocol, so its finished sessions never reach the store the
+    fold scans; this imports them: every `<home>/sessions/<workspace>/session_*/state.json`
+    with a main wire.jsonl becomes a session record under the repository its cwd names
+    (skipped when already recorded or folded), and the fold is handed the new records --
+    unless `--no-fold`."""
+    from .store import Store
+    sessions_root = os.path.join(os.path.expanduser(args.home), "sessions")
+    imported, skipped = 0, 0
+    by_cwd = {}
+    for state_path in sorted(glob.glob(
+            os.path.join(sessions_root, "*", "session_*", "state.json"))):
+        sess_dir = os.path.dirname(state_path)
+        try:
+            with open(state_path, encoding="utf-8") as fh:
+                st = json.load(fh)
+        except (OSError, ValueError):
+            skipped += 1
+            continue
+        sid, cwd = str(st.get("id") or ""), str(st.get("cwd") or "")
+        wire = os.path.join(sess_dir, "agents", "main", "wire.jsonl")
+        if not sid or not cwd or not os.path.exists(wire):
+            skipped += 1
+            continue
+        store = Store(paths.repo_state_dir(paths.repo_identity(cwd), "kimi"))
+        if store.read(os.path.join("sessions", f"{sid}.json")) or \
+                sid in (store.read("folded.json") or {}):
+            skipped += 1
+            continue
+        ms = lambda v: (float(v) / 1000.0) if isinstance(v, (int, float)) else None
+        store.write(os.path.join("sessions", f"{sid}.json"), {
+            "session_id": sid, "host": "kimi", "cwd": cwd,
+            "started": ms(st.get("createdAt")), "ended": ms(st.get("updatedAt")),
+            "transcript": wire, "turns": [], "nudges": 0, "aborts": 0,
+            "judge_tokens": 0.0, "writer_tokens": 0.0, "imported": True})
+        imported += 1
+        by_cwd.setdefault(cwd, []).append(sid)
+    if not args.no_fold:
+        for cwd, sids in sorted(by_cwd.items()):
+            fold.spawn_fold(LiveContext.build(hosts.Kimi(), cwd), sids)
+    print(f"imported {imported} kimi session(s), skipped {skipped}"
+          + ("" if args.no_fold else f", folding {sum(map(len, by_cwd.values()))}"))
+    return 0
+
+
 # ---- repos ----------------------------------------------------------------------------------
 def _when(ts):
     return time.strftime("%Y-%m-%d %H:%M", time.localtime(ts)) if ts else "-"
@@ -740,6 +810,14 @@ def build_parser():
     p.add_argument("--session", required=True)
     p.add_argument("--job", required=True)
     p.set_defaults(fn=cmd_judge)
+    p = add("kimi-import")
+    p.add_argument("--home", default=os.environ.get("KIMI_CODE_HOME") or
+                   os.path.join(os.path.expanduser("~"), ".kimi-code"))
+    p.add_argument("--no-fold", action="store_true")
+    p.set_defaults(fn=cmd_kimi_import)
+    p = add("kimi-hooks")
+    p.add_argument("action", nargs="?", default="install", choices=("install", "uninstall"))
+    p.set_defaults(fn=cmd_kimi_hooks)
     add("doctor").set_defaults(fn=cmd_doctor)
     p = add("repos")
     p.add_argument("action", nargs="?", default="list", choices=("list", "migrate", "merge"))

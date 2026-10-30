@@ -347,6 +347,41 @@ def copilot_call(prompt, model="", cli="copilot", timeout=TIMEOUT_S):
     return text, eff
 
 
+def kimi_call(prompt, model="", cli="kimi", timeout=TIMEOUT_S):
+    """One prompt through Kimi Code's print mode. stream-json carries the reply
+    (`{"role":"assistant","content":...}`) and, on longer runs, usage records; a reply
+    without one reports no_usage, which the caller counts as zero cost."""
+    cmd = [cli, "-p", "--output-format", "stream-json"]
+    if model:
+        cmd += ["-m", model]
+    cmd.append(prompt)
+    with tempfile.TemporaryDirectory(prefix="te-side-") as cwd:
+        out = subprocess.run(cmd, capture_output=True, encoding="utf-8", errors="replace",
+                             timeout=timeout, env=_env(), cwd=cwd)
+    text, usage = "", {}
+    for line in (out.stdout or "").splitlines():
+        try:
+            ev = json.loads(line)
+        except ValueError:
+            continue
+        if not isinstance(ev, dict):
+            continue
+        if ev.get("role") == "assistant" and ev.get("content"):
+            text = str(ev["content"])
+        for key in ("usage", "usage_record"):
+            if isinstance(ev.get(key), dict):
+                usage = {**usage, **ev[key]}
+    if not text:
+        _no_reply("kimi", out)
+    if "input_tokens" not in usage and "inputOther" in usage:
+        usage = {"input_tokens": usage.get("inputOther", 0),
+                 "cache_read_input_tokens": usage.get("inputCacheRead", 0),
+                 "cache_creation_input_tokens": usage.get("inputCacheCreation", 0),
+                 "output_tokens": usage.get("output", 0)}
+    eff, _ = accounting.effective(usage)
+    return text, eff
+
+
 def runner_for(host_name, config):
     """The optimizer callable for this host. Each host's calls go through that host's own CLI,
     never another agent's. The caller decides whether a call is allowed: micro-skills' proposer
@@ -360,4 +395,6 @@ def runner_for(host_name, config):
         return lambda prompt, _m="agent": codex_call(prompt, model=model)
     if host_name == "copilot":
         return lambda prompt, _m="agent": copilot_call(prompt, model=model)
+    if host_name == "kimi":
+        return lambda prompt, _m="agent": kimi_call(prompt, model=model)
     return lambda prompt, _m="agent": claude_call(prompt, model=model or "haiku")

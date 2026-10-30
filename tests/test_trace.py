@@ -1,4 +1,5 @@
 """Trace seam: load_trajectory / tool_usage / parse_catalog over synthetic transcripts."""
+import argparse
 import os
 
 from tokeneconomizer import trace
@@ -232,3 +233,112 @@ def test_a_pi_session_counts_the_prompts_on_its_active_branch(tmp_path):
         msg("x", "b", "user"), msg("y", "x", "assistant"),        # abandoned
         msg("c", "b", "user"), msg("d", "c", "toolResult"), msg("e", "d", "assistant")])
     assert trace.pi_prompt_count(p) == 2
+
+
+# ---- Kimi Code wire.jsonl --------------------------------------------------------------------
+
+def _kimi_session(tmp_path, events, cwd="/w/repo"):
+    """A synthetic Kimi session: <tmp>/sessions/wd_x/session_s1/{state.json, agents/main/wire.jsonl}."""
+    import json as _json
+    sess = tmp_path / "sessions" / "wd_x" / "session_s1"
+    (sess / "agents" / "main").mkdir(parents=True)
+    (sess / "state.json").write_text(_json.dumps(
+        {"id": "session_s1", "cwd": cwd, "createdAt": 1000000, "updatedAt": 2000000}))
+    wire = sess / "agents" / "main" / "wire.jsonl"
+    wire.write_text("\n".join(_json.dumps(e) for e in events))
+    return str(wire)
+
+
+def _kimi_wire(tmp_path):
+    """The events of one Kimi session: two prompts, a failed Bash call, a subagent call."""
+    def appended(role, **kw):
+        return {"type": "agent.message.appended",
+                "message": {"message": dict({"role": role}, **kw), "meta": {"source": "x"}}}
+    return _kimi_session(tmp_path, [
+        {"type": "metadata", "protocol_version": "1.5"},
+        {"type": "turn.prompt", "agentId": "main",
+         "input": [{"type": "text", "text": "run the tests"}], "turnId": 0},
+        appended("user", content=[{"type": "text", "text": "run the tests"}],
+                 id="msg_1", toolCalls=[]),
+        appended("assistant",
+                 content=[{"type": "text", "text": "running"}],
+                 toolCalls=[{"type": "function", "id": "call_1", "name": "Bash",
+                             "arguments": '{"command": "pytest -q"}'}]),
+        appended("tool", content=[{"type": "text", "text": "2 failed\n"
+                                   "Command failed with exit code: 1."}],
+                 toolCallId="call_1"),
+        {"type": "turn.prompt", "agentId": "main",
+         "input": [{"type": "text", "text": "fix it"}], "turnId": 1},
+        {"type": "context.append_message", "agentId": "main",
+         "message": {"role": "user", "content": [{"type": "text", "text": "<system-reminder>"}],
+                     "toolCalls": [], "origin": {"kind": "injection"}}},
+        appended("assistant", content=[], toolCalls=[
+            {"type": "function", "id": "call_2", "name": "Agent",
+             "arguments": '{"prompt": "dig"}'}]),
+        appended("tool", content=[{"type": "text", "text": "done"}],
+                 toolCallId="call_2"),
+        {"type": "usage.record", "agentId": "main", "model": "kimi-code/kimi-for-coding",
+         "usage": {"inputOther": 100, "output": 10, "inputCacheRead": 50,
+                   "inputCacheCreation": 5}, "usageScope": "turn"},
+        {"type": "usage.record", "agentId": "main", "model": "kimi-code/kimi-for-coding",
+         "usage": {"inputOther": 200, "output": 20, "inputCacheRead": 60,
+                   "inputCacheCreation": 0}, "usageScope": "turn"},
+    ])
+
+
+def test_kimi_wire_reads_as_calls_with_the_session_cwd(tmp_path):
+    p = _kimi_wire(tmp_path)
+    traj = trace.load_trajectory(p)
+    assert [(c[0], c[1].get("command") or c[1].get("prompt"), c[3]) for c in traj] == [
+        ("Bash", "pytest -q", False), ("Agent", "dig", True)]
+    assert trace.call_cwds(p) == ["/w/repo", "/w/repo"]
+    assert trace.tool_usage(p) == {"Bash": 1, "Agent": 1}
+
+
+def test_kimi_prompts_are_turn_prompts_injections_ignored(tmp_path):
+    assert trace.kimi_prompt_count(_kimi_wire(tmp_path)) == 2
+
+
+def test_kimi_usage_sums_every_step_record(tmp_path):
+    u = trace.kimi_session_usage(_kimi_wire(tmp_path))
+    assert u["input_tokens"] == 300
+    assert u["cache_read_input_tokens"] == 110
+    assert u["cache_creation_input_tokens"] == 5
+    assert u["output_tokens"] == 30
+    assert u["requests"] == 2
+    assert u["model"] == "kimi-code/kimi-for-coding"
+
+
+def test_kimi_tools_snapshot_is_the_catalog(tmp_path):
+    snap = {"type": "llm.tools_snapshot", "agentId": "main", "tools": [
+        {"name": "Bash", "description": "Run a shell command."},
+        {"name": "Agent", "description": "Launch a subagent."}]}
+    later = {"type": "llm.tools_snapshot", "agentId": "main", "tools": [
+        {"name": "Bash", "description": "Run a shell command."}]}
+    p = _kimi_session(tmp_path, [snap, later])
+    cat = trace.parse_tool_catalog_kimi(open(p, encoding="utf-8").read())
+    assert cat == {"Bash": "Run a shell command."}   # the last snapshot wins
+    run = tmp_path / "run"          # the fold's run dir: transcript.jsonl -> the wire log
+    run.mkdir()
+    (run / "transcript.jsonl").write_text(open(p, encoding="utf-8").read())
+    assert trace.parse_catalog_with_source(str(run), "kimi")[1] == "kimi_tools_snapshot"
+
+
+def test_kimi_import_records_sessions_and_skips_known_ones(tmp_path, monkeypatch):
+    from tokeneconomizer.plugin import cli
+    wire = _kimi_wire(tmp_path)
+    home = tmp_path / "kimi-home"
+    home.mkdir()
+    import shutil
+    shutil.move(str(tmp_path / "sessions"), str(home / "sessions"))
+    monkeypatch.setenv("TOKENECONOMIZER_HOME", str(tmp_path / "te-state"))
+    monkeypatch.setenv("TE_FOLD_SYNC", "1")
+    args = argparse.Namespace(home=str(home), no_fold=True)
+    assert cli.cmd_kimi_import(args) == 0
+    from tokeneconomizer.plugin.store import Store
+    from tokeneconomizer.plugin.paths import repo_identity, repo_state_dir
+    store = Store(repo_state_dir(repo_identity("/w/repo"), "kimi"))
+    rec = store.read(os.path.join("sessions", "session_s1.json"))
+    assert rec["host"] == "kimi" and rec["transcript"].endswith("wire.jsonl") \
+        and rec["ended"] == 2000.0
+    assert cli.cmd_kimi_import(args) == 0   # second run skips the recorded session

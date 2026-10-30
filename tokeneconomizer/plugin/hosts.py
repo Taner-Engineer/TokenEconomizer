@@ -38,6 +38,7 @@ named `rollout-*`; Copilot's session-state transcript, or no transcript at all i
 hook process; Claude Code otherwise. Each plugin hook file except Claude Code's also passes
 `--host` explicitly, so detection is the fallback rather than the rule.
 """
+import glob
 import json
 import os
 import re
@@ -480,8 +481,64 @@ def _ancestor_args(limit=4):
     return out
 
 
+def kimi_home(env=None):
+    env = os.environ if env is None else env
+    return env.get("KIMI_CODE_HOME") or os.path.join(os.path.expanduser("~"), ".kimi-code")
+
+
+class Kimi(Host):
+    """Kimi Code CLI, through the `[[hooks]]` rules `te kimi-hooks install` writes into
+    `$KIMI_CODE_HOME/config.toml`. The hook contract is Claude-shaped (JSON on stdin with
+    `hook_event_name` / `session_id` / `cwd` / `tool_name` / `tool_input`; a JSON
+    `hookSpecificOutput` on stdout), so this adapter is the read side of the same protocol,
+    with three kimi differences:
+
+      * `SessionStart` is observation-only: returned context does not reach the model. Facts
+        are (re)injected at `UserPromptSubmit` instead, which is blockable and appends the
+        returned text to the context -- so `keeps_start_context` is False and the first
+        prompt of every session (and resume) carries the block.
+      * The payload names no transcript path; the session log is found from `session_id`
+        under `<kimi home>/sessions/*/session_<id>/agents/main/wire.jsonl` (the trace seam
+        reads it: trace.kimi).
+      * `Stop` is blockable: blocking it appends a message and lets the model continue --
+        the channel a stuck-turn notice uses when a nudge needs the model's own voice.
+    """
+    name = "kimi"
+    prompt_context = True              # UserPromptSubmit: returned text appended to context
+    keeps_start_context = False        # SessionStart context is dropped; re-inject per session
+    relays_notices = True              # observation events have no UI channel for hook text
+    interrupt = "Press Esc twice to interrupt it."
+    end_run = "Press Ctrl+C to end the run."
+
+    def transcript(self, p):
+        tp = p.get("transcript_path") or ""
+        if tp:
+            return tp
+        sid = self.session_id(p)
+        if not sid:
+            return ""
+        stem = sid[len("session_"):] if sid.startswith("session_") else sid
+        pat = os.path.join(kimi_home(), "sessions", "*",
+                           f"session_{stem}", "agents", "main", "wire.jsonl")
+        for path in sorted(glob.glob(pat)):
+            return path
+        return ""
+
+    def turn_key(self, p):
+        return str(p.get("prompt_id") or p.get("turn_id") or "")
+
+    def session_usage(self, transcript_path):
+        return trace.kimi_session_usage(transcript_path)
+
+    def prompt_count(self, transcript_path):
+        return trace.kimi_prompt_count(transcript_path)
+
+    def tool_usage(self, trace_path):
+        return trace.kimi_tool_usage(os.path.realpath(trace_path))
+
+
 HOSTS = {"claude": ClaudeCode, "codex": Codex, "copilot": Copilot, "opencode": OpenCode,
-         "pi": Pi}
+         "pi": Pi, "kimi": Kimi}
 
 
 def default_host(env=None, recent=None):
@@ -506,6 +563,8 @@ def detect(payload, env=None, hint=None):
     if "turn_id" in (payload or {}):
         return Codex()
     tp = str((payload or {}).get("transcript_path") or "")
+    if os.path.basename(tp) == "wire.jsonl" or f"{os.sep}.kimi-code{os.sep}" in tp:
+        return Kimi()
     sp = tp.replace("\\", "/")              # a Windows path, with either separator
     if sp.rsplit("/", 1)[-1].startswith("rollout-") or "/.codex/" in sp:
         return Codex()

@@ -12,6 +12,7 @@ import re
 from .claude import claude_calls
 from .codex import codex_exec_calls
 from .copilot import copilot_event_calls, copilot_session_cwd
+from .kimi import is_kimi_wire, kimi_calls
 
 # rtk in its Codex mode changes the COMMAND LINE rather than hooking it: the agent is told to
 # type `rtk pytest`, `rtk git status`, `rtk proxy <cmd>`. Every classifier that reads a
@@ -34,13 +35,16 @@ def _is_codex_exec(lines):
 def load_trajectory(path):
     """Ordered [(tool_name, args, result_text, success)] over a saved session log.
 
-    The schema is sniffed from the lines: Codex emits completed items, Claude Code emits message
-    envelopes carrying `tool_use` blocks, and anything else is read as Copilot events."""
+    The schema is sniffed from the lines: Codex emits completed items, Kimi Code's wire log
+    emits `agent.message.appended` records, Claude Code emits message envelopes carrying
+    `tool_use` blocks, and anything else is read as Copilot events."""
     if not os.path.exists(path):
         return []
     lines = [l.strip() for l in open(path, encoding="utf-8", errors="replace") if l.strip()]
     if _is_codex_exec(lines):
         return codex_exec_calls(lines)
+    if is_kimi_wire(lines):
+        return [c[:4] for c in kimi_calls(path)]
     if any('"tool_use"' in line or '"type": "assistant"' in line or '"type":"assistant"' in line
            for line in lines):
         return [c[:4] for c in claude_calls(lines)]
@@ -53,13 +57,17 @@ def call_cwds(path):
     transcript records it on every entry: after `cd tests && ...`, a bare `python runtests.py`
     runs in `tests/`. Codex runs each command afresh. Copilot's log records only where the
     session started, and that is where its calls are read as starting: models there type
-    `cd <that directory> && ...` before every command, which is then the plain form."""
+    `cd <that directory> && ...` before every command, which is then the plain form. Kimi's
+    wire events carry no directory at all; the session has one cwd (state.json), used for
+    every call."""
     calls = load_trajectory(path)
     if not calls or not os.path.exists(path):
         return [None] * len(calls)
     lines = [l.strip() for l in open(path, encoding="utf-8", errors="replace") if l.strip()]
     if _is_codex_exec(lines):
         return [None] * len(calls)
+    if is_kimi_wire(lines):
+        return [c[4] for c in kimi_calls(path)]
     cwds = [c[4] for c in claude_calls(lines)]
     if len(cwds) == len(calls):
         return cwds
