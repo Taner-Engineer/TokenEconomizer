@@ -181,7 +181,8 @@ def _fold_toolprune(ctx, adapter, run_dir, session_id, transcript=None, workdir=
             if s not in applied and s not in kept]
         doc["servers"] = _server_summary(stage, servers, prompt_streaks)
     else:
-        proposal = [t for t in raw if t not in applied and t not in kept]
+        proposal = [t for t in raw if t not in applied and t not in kept
+                    and not denylist.never_propose(t)]
     doc["proposal"] = proposal
     doc["new_in_proposal"] = sorted(set(proposal) - set(st.get("proposal", [])))
     if ctx.config.toolprune == "auto" and proposal and not ctx.config.shadow:

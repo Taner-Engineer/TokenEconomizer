@@ -184,6 +184,18 @@ def _exclude_from_git(repo_root, rel=SETTINGS_REL):
 # record held one file's entries (`{"tools", "path"}`); that shape is still read.
 APPLIED = "untool_applied.json"
 
+# Tools that must never land in a tool-pruning proposal, whatever the evidence says:
+# another plugin's infrastructure surface. billion-context's MCP tools (/acp status and
+# friends) are called deliberately, rarely -- exactly the shape "unused" evidence punishes --
+# but denying them would blind the session to its own compression. Matched against the
+# tool name on every host.
+NEVER_PROPOSE_RE = re.compile(r"^mcp__bili(__|$)|^bili$")
+
+
+def never_propose(tool):
+    """True when `tool` is off-limits for tool pruning (see NEVER_PROPOSE_RE)."""
+    return bool(NEVER_PROPOSE_RE.match(tool or ""))
+
 
 def _canon(path):
     return os.path.realpath(path) if path else ""

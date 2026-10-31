@@ -65,3 +65,13 @@ def test_apply_refuses_what_it_cannot_own(repo, tmp_path):
     open(path, "w", encoding="utf-8").write("no frontmatter at all\n")
     with pytest.raises(RuntimeError, match="no --- frontmatter"):
         denylist.apply(repo, ["WebSearch"], store, "kimi")
+
+
+def test_bili_tools_are_never_proposed():
+    from tokeneconomizer.plugin import denylist
+    assert denylist.never_propose("mcp__bili__acp")
+    assert denylist.never_propose("mcp__bili__acp_cache")
+    assert denylist.never_propose("bili")
+    assert not denylist.never_propose("mcp__github__get_issue")
+    assert not denylist.never_propose("Bash")
+    assert not denylist.never_propose("WebSearch")

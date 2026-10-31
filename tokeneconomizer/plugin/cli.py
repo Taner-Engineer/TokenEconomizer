@@ -299,7 +299,8 @@ def _proposal(ctx, unt):
     repository share its evidence, and one of them may have applied the list before another."""
     mine = set(denylist.applied_for(ctx.store, ctx.repo.root, ctx.host.name))
     mine |= set(denylist.kept_for(ctx.store, ctx.repo.root, ctx.host.name))
-    return [t for t in unt.get("proposal", []) if t not in mine]
+    return [t for t in unt.get("proposal", []) if t not in mine
+            and not denylist.never_propose(t)]
 
 
 def cmd_toolprune(args):
